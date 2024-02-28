@@ -1,0 +1,207 @@
+classdef (StrictDefaults)LiveCrossover < matlab.System & audioPlugin
+    properties
+        CutoffFrequencyHz = 20;
+    end
+    properties 
+        SlopeDbPerOctave = 12
+    end
+    
+    properties (Constant)
+        PluginInterface = audioPluginInterface( ...
+            'InputChannels',2,...
+            'OutputChannels',2,...
+            'PluginName','LiveCrossover',...
+            audioPluginParameter('Cutoff', ...
+            'DisplayName',  'Cutoff', ...
+            'Label',  'Hz', ...
+            'Mapping', { 'log', 20, 20000},...
+            'Style', 'rotaryknob', 'Layout', [1 1]),...
+            audioPluginParameter('Slope', ...
+            'DisplayName',  'Slope', ...
+            'Label',  'dB/octave', ...
+            'Mapping',  { 'lin', 0, 48},...
+            'Layout', [3 1]),...
+            audioPluginGridLayout('RowHeight', [100 20 30 20], ...
+            'Padding', [10 10 10 30]), ...
+            'BackgroundColor', 'c');
+    end    
+    
+    properties (Access = private)    
+        Numerator
+        Denominator
+        SosBiquadFilterObj     
+        visualObj
+        AreFiltersDesigned = false;
+    end
+    
+    methods
+        function plugin = LiveCrossover(cutoffFrequency, slope)
+            if nargin > 0
+                plugin.CutoffFrequencyHz = cutoffFrequency;
+            end
+            
+            if nargin > 1
+                plugin.SlopeDbPerOctave = slope;
+            end
+            
+            plugin.SosBiquadFilterObj = dsp.SOSFilter('CoefficientSource','Input port',...
+                'HasScaleValues',false);
+            
+            calculateCoefficients(plugin);
+        end
+        
+        function varargout = visualize(plugin,NFFT)
+            %VISUALIZE Visualize magnitude response of equalizer
+            %   VISUALIZE(plugin) shows the magnitude response of the
+            %   filter.
+            %
+            %   VISUALIZE(plugin,NFFT) uses NFFT points to display the
+            %   magnitude response.
+            %
+            %   VIS = VISUALIZE(plugin,...) returns a handle to the
+            %   visualizer.
+            if nargin < 2
+                NFFT = 2048;
+            end
+            
+            if isempty(plugin.visualObj) || ~isvalid(plugin.visualObj)
+                Fs = getSampleRate(plugin);                               
+                calculateCoefficients(plugin);
+                
+                plugin.visualObj = dsp.DynamicFilterVisualizer(...
+                    NFFT,Fs,[20 20e3], ...
+                    'XScale', 'Log', ...
+                    'YLimits', [-60 0], ...
+                    'Title', 'Variable Slope IIR Bandpass Filter');
+            else
+                plugin.visualObj.FFTLength = NFFT;
+                if ~isVisible(plugin.visualObj)
+                    show(plugin.visualObj);
+                end
+            end
+            % Step the visual object with the filter
+            step(plugin.visualObj, plugin);
+
+            if nargout >0
+                varargout{1} = plugin.visualObj;
+            end
+        end
+        
+        function [b,a] = coeffs(plugin)
+            if ~plugin.AreFiltersDesigned
+                calculateCoefficients(plugin);
+            end
+            b = plugin.Numerator;
+            a = plugin.Denominator;
+        end
+               
+        function set.CutoffFrequencyHz(plugin,val)
+            validateattributes(val, {'numeric'}, ...
+                {'finite','real','scalar','nonnegative'},...
+                'set.LowCutoff','LowCutoff');
+            
+            plugin.CutoffFrequencyHz = val;
+            needToDesignFilters(plugin);
+        end
+        
+        function set.SlopeDbPerOctave(plugin,val)
+            plugin.SlopeDbPerOctave = min(6*round(val/6),48);
+            needToDesignFilters(plugin);
+        end
+        
+    end
+    
+    methods(Access = protected)
+        
+        function releaseImpl(plugin)
+            release(plugin.SosBiquadFilterObj);
+        end
+        
+        function out = stepImpl(plugin, in)
+            out = plugin.SosBiquadFilterObj(in, plugin.Numerator, plugin.Denominator);
+        end
+        
+        function resetImpl(plugin)
+            reset(plugin.SosBiquadFilterObj);
+            calculateCoefficients(plugin);
+        end
+        
+        function processTunedPropertiesImpl(plugin)
+            if ~plugin.AreFiltersDesigned
+                calculateCoefficients(plugin);                
+            end            
+        end
+        
+        function [B, A] = getFilterCoefficients(plugin)
+            B = plugin.Numerator;
+            A = plugin.Denominator;
+        end
+
+        function flag = isInputSizeMutableImpl(~,~)
+            flag = true;
+        end
+
+        function s = saveObjectImpl(obj)
+            s = saveObjectImpl@matlab.System(obj);
+            s = savePluginProps(obj,s);
+            if isLocked(obj)
+                s.SOSObj = matlab.System.saveObject(obj.SosBiquadFilterObj);
+                s.Num = obj.Numerator;
+                s.Den = obj.Denominator;
+                s.AreFiltersDesigned = obj.AreFiltersDesigned;
+            end
+        end
+
+        function loadObjectImpl(obj, s, wasLocked)
+            if wasLocked
+                obj.SosBiquadFilterObj = matlab.System.loadObject(s.SOSObj);
+                obj.Numerator = s.Num;
+                obj.Denominator = s.Den;
+                obj.AreFiltersDesigned = s.AreFiltersDesigned;
+            end
+            loadObjectImpl@matlab.System(obj,s,wasLocked);
+            reload(obj,s);
+        end
+    end
+    
+    methods (Access = private)
+        function calculateCoefficients(plugin)
+            Fs = getSampleRate(plugin);
+            [B1,A1] = designVarSlopeFilter(plugin.SlopeDbPerOctave,plugin.CutoffFrequencyHz/(Fs/2),'hi','Orientation','row');
+            plugin.Numerator = [B1];
+            plugin.Denominator = [A12];
+            plugin.AreFiltersDesigned = true;
+        end
+        
+        function needToDesignFilters(plugin)
+            plugin.AreFiltersDesigned = false; 
+            if isempty(coder.target) && ~isempty(plugin.visualObj) && isvalid(plugin.visualObj) 
+                calculateCoefficients(plugin);
+                num = plugin.Numerator;
+                den = plugin.Denominator;
+                step(plugin.visualObj, num, den);
+                plugin.visualObj.SampleRate = plugin.getSampleRate;
+            end
+        end
+    end
+    
+    methods(Static, Access = protected)
+        function group = getPropertyGroupsImpl
+            % This is needed to define dependent properties for MATLAB System block
+            group = matlab.system.display.Section('Title', getString(message('dsp:system:Shared:Parameters')), ...
+                'PropertyList', {'Cutoff', 'Slope','PluginInterface'}, ...
+                'DependOnPrivatePropertyList',{'Slope'});
+        end
+    end
+    
+    methods (Hidden)
+        function h = freqz(plugin, f, Fs)
+            [B, A] = getFilterCoefficients(plugin);
+            h = zeros(length(f),1);
+            h(:,1) = freqz(B(1,:), A(1,:), f, Fs);
+            for k = 2:size(B,1)
+                h(:,1) = h(:,1).*freqz(B(k, :), A(k, :) , f, Fs).';
+            end
+        end
+    end
+end
